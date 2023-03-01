@@ -1,4 +1,4 @@
-idf_component_register(REQUIRES esp_rom freertos soc PRIV_REQUIRES arduino main)
+idf_component_register(REQUIRES esp_rom freertos soc PRIV_REQUIRES)
 
 if(CONFIG_TINYUSB_ENABLED)
 
