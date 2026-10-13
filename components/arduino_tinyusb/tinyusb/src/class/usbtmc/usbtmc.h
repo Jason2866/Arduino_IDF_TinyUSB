@@ -1,32 +1,13 @@
-
 /*
- * The MIT License (MIT)
- *
- * Copyright (c) 2019 N Conrad
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * SPDX-FileCopyrightText: Copyright (c) 2019 Nathan Conrad
+ * SPDX-FileCopyrightText: Copyright (c) 2019 Ha Thach (tinyusb.org)
+ * SPDX-License-Identifier: MIT
  *
  * This file is part of the TinyUSB stack.
  */
 
-#ifndef _TUSB_USBTMC_H__
-#define _TUSB_USBTMC_H__
+#ifndef TUSB_USBTMC_H__
+#define TUSB_USBTMC_H__
 
 #include "common/tusb_common.h"
 
@@ -184,6 +165,23 @@ typedef enum {
 } usmtmc_request_type_enum;
 
 typedef enum {
+  // The last and first valid bNotify1 for use by the USBTMC class specification.
+  USBTMC_bNOTIFY1_USBTMC_FIRST          = 0x00,
+  USBTMC_bNOTIFY1_USBTMC_LAST           = 0x3F,
+
+  // The last and first valid bNotify1 for use by vendors.
+  USBTMC_bNOTIFY1_VENDOR_SPECIFIC_FIRST = 0x40,
+  USBTMC_bNOTIFY1_VENDOR_SPECIFIC_LAST  = 0x7F,
+
+  // The last and first valid bNotify1 for use by USBTMC subclass specifications.
+  USBTMC_bNOTIFY1_SUBCLASS_FIRST        = 0x80,
+  USBTMC_bNOTIFY1_SUBCLASS_LAST         = 0xFF,
+
+  // From the USB488 Subclass Specification, Section 3.4.
+  USB488_bNOTIFY1_SRQ                   = 0x81,
+} usbtmc_int_in_payload_format;
+
+typedef enum {
   USBTMC_STATUS_SUCCESS = 0x01,
   USBTMC_STATUS_PENDING = 0x02,
   USBTMC_STATUS_FAILED = 0x80,
@@ -262,14 +260,14 @@ typedef struct TU_ATTR_PACKED
 
   struct TU_ATTR_PACKED
   {
-    unsigned int listenOnly :1;
-    unsigned int talkOnly :1;
-    unsigned int supportsIndicatorPulse :1;
+    uint8_t listenOnly :1;
+    uint8_t talkOnly :1;
+    uint8_t supportsIndicatorPulse :1;
   } bmIntfcCapabilities;
 
   struct TU_ATTR_PACKED
   {
-    unsigned int canEndBulkInOnTermChar :1;
+    uint8_t canEndBulkInOnTermChar :1;
   } bmDevCapabilities;
 
   uint8_t _reserved2[6];
@@ -277,17 +275,17 @@ typedef struct TU_ATTR_PACKED
 
   struct TU_ATTR_PACKED
   {
-    unsigned int is488_2 :1;
-    unsigned int supportsREN_GTL_LLO :1;
-    unsigned int supportsTrigger :1;
+    uint8_t supportsTrigger :1;
+    uint8_t supportsREN_GTL_LLO :1;
+    uint8_t is488_2 :1;
   } bmIntfcCapabilities488;
 
   struct TU_ATTR_PACKED
   {
-    unsigned int SCPI :1;
-    unsigned int SR1 :1;
-    unsigned int RL1 :1;
-    unsigned int DT1 :1;
+    uint8_t DT1 :1;
+    uint8_t RL1 :1;
+    uint8_t SR1 :1;
+    uint8_t SCPI :1;
   } bmDevCapabilities488;
   uint8_t _reserved3[8];
 } usbtmc_response_capabilities_488_t;
@@ -305,6 +303,14 @@ TU_VERIFY_STATIC(sizeof(usbtmc_read_stb_rsp_488_t) == 3u, "struct wrong length")
 
 typedef struct TU_ATTR_PACKED
 {
+  uint8_t bNotify1; // Must be USB488_bNOTIFY1_SRQ
+  uint8_t StatusByte;
+} usbtmc_srq_interrupt_488_t;
+
+TU_VERIFY_STATIC(sizeof(usbtmc_srq_interrupt_488_t) == 2u, "struct wrong length");
+
+typedef struct TU_ATTR_PACKED
+{
   struct TU_ATTR_PACKED
   {
       unsigned int bTag : 7;
@@ -316,4 +322,3 @@ typedef struct TU_ATTR_PACKED
 TU_VERIFY_STATIC(sizeof(usbtmc_read_stb_interrupt_488_t) == 2u, "struct wrong length");
 
 #endif
-

@@ -1,142 +1,967 @@
-if (NOT TARGET _family_support_marker)
-    add_library(_family_support_marker INTERFACE)
+include_guard(GLOBAL)
 
-    if (NOT FAMILY)
-        message(FATAL_ERROR "You must set a FAMILY variable for the build (e.g. rp2040, eps32s2, esp32s3). You can do this via -DFAMILY=xxx on the cmake command line")
+include(CMakePrintHelpers)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+#set(CMAKE_C_STANDARD 11)
+
+# TOP is path to root directory
+set(TOP "${CMAKE_CURRENT_LIST_DIR}/../..")
+get_filename_component(TOP ${TOP} ABSOLUTE)
+
+set(UF2CONV_PY ${TOP}/tools/uf2/utils/uf2conv.py)
+set(LINKERMAP_PY ${TOP}/tools/linkermap/linkermap.py)
+
+function(family_resolve_board BOARD_NAME BOARD_PATH_OUT)
+  if ("${BOARD_NAME}" STREQUAL "")
+    message(FATAL_ERROR "You must set BOARD (e.g. metro_m4_express, raspberry_pi_pico). Use -DBOARD=xxx on the cmake command line.")
+  endif()
+
+  file(GLOB _board_paths
+    LIST_DIRECTORIES true
+    RELATIVE ${TOP}/hw/bsp
+    ${TOP}/hw/bsp/*/boards/*
+    )
+
+  set(_hint_names "")
+  foreach(_board_path ${_board_paths})
+    get_filename_component(_board_name ${_board_path} NAME)
+    if (_board_name STREQUAL "${BOARD_NAME}")
+      set(${BOARD_PATH_OUT} ${_board_path} PARENT_SCOPE)
+      return()
     endif()
-
-    if (NOT EXISTS ${CMAKE_CURRENT_LIST_DIR}/${FAMILY}/family.cmake)
-        message(FATAL_ERROR "Family '${FAMILY}' is not known/supported")
+    string(FIND "${_board_name}" "${BOARD_NAME}" _pos)
+    if (_pos EQUAL 0)
+      list(APPEND _hint_names ${_board_name})
     endif()
+  endforeach()
 
-    function(family_filter RESULT DIR)
-        get_filename_component(DIR ${DIR} ABSOLUTE BASE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+  if (_hint_names)
+    list(REMOVE_DUPLICATES _hint_names)
+    list(SORT _hint_names)
+    list(JOIN _hint_names ", " _hint_str)
+    message(FATAL_ERROR "BOARD '${BOARD_NAME}' not found. Boards with the same prefix:\n${_hint_str}")
+  else()
+    message(FATAL_ERROR "BOARD '${BOARD_NAME}' not found under hw/bsp/*/boards")
+  endif()
+endfunction()
 
-        if (EXISTS "${DIR}/only.txt")
-            file(READ "${DIR}/only.txt" ONLYS)
-            # Replace newlines with semicolon so that it is treated as a list by CMake
-            string(REPLACE "\n" ";" ONLYS_LINES ${ONLYS})
-            # For each mcu
-            foreach(MCU IN LISTS FAMILY_MCUS)
-                # For each line in only.txt
-                foreach(_line ${ONLYS_LINES})
-                    # If mcu:xxx exists for this mcu then include
-                    if (${_line} STREQUAL "mcu:${MCU}")
-                        set(${RESULT} 1 PARENT_SCOPE)
-                        return()
-                    endif()
-                endforeach()
-            endforeach()
+#-------------------------------------------------------------
+# Toolchain
+# Can be changed via -DTOOLCHAIN=gcc|iar or -DCMAKE_C_COMPILER= or ENV{CC}=
+#-------------------------------------------------------------
+function(detect_compiler COMPILER_PATH RESULT)
+  string(FIND ${COMPILER_PATH} "iccarm" IS_IAR)
+  string(FIND ${COMPILER_PATH} "clang" IS_CLANG)
+  string(FIND ${COMPILER_PATH} "gcc" IS_GCC)
 
-            # Didn't find it in only file so don't build
-            set(${RESULT} 0 PARENT_SCOPE)
+  if (NOT IS_IAR EQUAL -1)
+    set(${RESULT} iar PARENT_SCOPE)
+  elseif (NOT IS_CLANG EQUAL -1)
+    set(${RESULT} clang PARENT_SCOPE)
+  elseif (NOT IS_GCC EQUAL -1)
+    set(${RESULT} gcc PARENT_SCOPE)
+  endif ()
+endfunction()
 
-        elseif (EXISTS "${DIR}/skip.txt")
-            file(READ "${DIR}/skip.txt" SKIPS)
-            # Replace newlines with semicolon so that it is treated as a list by CMake
-            string(REPLACE "\n" ";" SKIPS_LINES ${SKIPS})
-            # For each mcu
-            foreach(MCU IN LISTS FAMILY_MCUS)
-                # For each line in only.txt
-                foreach(_line ${SKIPS_LINES})
-                    # If mcu:xxx exists for this mcu then skip
-                    if (${_line} STREQUAL "mcu:${MCU}")
-                        set(${RESULT} 0 PARENT_SCOPE)
-                        return()
-                    endif()
-                endforeach()
-            endforeach()
+# Detect toolchain based on CMAKE_C_COMPILER or ENV{CC}
+if (DEFINED CMAKE_C_COMPILER)
+  detect_compiler(${CMAKE_C_COMPILER} TOOLCHAIN)
+elseif (DEFINED ENV{CC})
+  detect_compiler($ENV{CC} TOOLCHAIN)
+endif ()
 
-            # Didn't find in skip file so build
-            set(${RESULT} 1 PARENT_SCOPE)
+if (NOT DEFINED TOOLCHAIN)
+  set(TOOLCHAIN gcc)
+endif ()
 
-        else()
+set(WARN_FLAGS_GNU
+  -Wall
+  -Wextra
+  -Werror
+  -Wfatal-errors
+  -Wdouble-promotion
+  -Wstrict-prototypes
+  -Wstrict-overflow
+  -Werror-implicit-function-declaration
+  -Wfloat-equal
+  -Wundef
+  -Wshadow
+  -Wwrite-strings
+  -Wsign-compare
+  -Wmissing-format-attribute
+  -Wunreachable-code
+  -Wcast-align
+  -Wcast-function-type
+  -Wcast-qual
+  -Wnull-dereference
+  -Wuninitialized
+  -Wunused
+  -Wunused-function
+  -Wreturn-type
+  -Wredundant-decls
+  -Wmissing-prototypes
+#  -Wconversion
+  )
+set(WARN_FLAGS_Clang ${WARN_FLAGS_GNU})
 
-            # Didn't find skip or only file so build
-            set(${RESULT} 1 PARENT_SCOPE)
+set(WARN_FLAGS_IAR
+  --warnings_are_errors
+  --diag_suppress=Pa089
+  --diag_suppress=Pe236
+  )
 
-        endif()
+# Optimization
+if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
+  set(CMAKE_BUILD_TYPE MinSizeRel CACHE STRING "Build type" FORCE)
+endif ()
 
-    endfunction()
+#-------------------------------------------------------------
+# FAMILY and BOARD
+#-------------------------------------------------------------
+if (NOT DEFINED FAMILY)
+  family_resolve_board("${BOARD}" BOARD_PATH)
 
-    function(family_add_subdirectory DIR)
-        family_filter(SHOULD_ADD "${DIR}")
-        if (SHOULD_ADD)
-            add_subdirectory(${DIR})
-        endif()
-    endfunction()
+  string(REPLACE "/" ";" BOARD_PATH ${BOARD_PATH})
+  list(GET BOARD_PATH 0 FAMILY)
+  set(FAMILY ${FAMILY} CACHE STRING "Board family")
+endif ()
 
-    function(family_get_project_name OUTPUT_NAME DIR)
-        get_filename_component(SHORT_NAME ${DIR} NAME)
-        set(${OUTPUT_NAME} ${TINYUSB_FAMILY_PROJECT_NAME_PREFIX}${SHORT_NAME} PARENT_SCOPE)
-    endfunction()
-
-    function(family_initialize_project PROJECT DIR)
-        family_filter(ALLOWED "${DIR}")
-        if (NOT ALLOWED)
-            get_filename_component(SHORT_NAME ${DIR} NAME)
-            message(FATAL_ERROR "${SHORT_NAME} is not supported on FAMILY=${FAMILY}")
-        endif()
-    endfunction()
-
-    function(family_add_default_example_warnings TARGET)
-        target_compile_options(${TARGET} PUBLIC
-                -Wall
-                -Wextra
-                -Werror
-                -Wfatal-errors
-                -Wdouble-promotion
-                -Wfloat-equal
-                -Wshadow
-                -Wwrite-strings
-                -Wsign-compare
-                -Wmissing-format-attribute
-                -Wunreachable-code
-                -Wcast-align
-                -Wcast-qual
-                -Wnull-dereference
-                -Wuninitialized
-                -Wunused
-                -Wredundant-decls
-                #-Wstrict-prototypes
-                #-Werror-implicit-function-declaration
-                #-Wundef
-                )
-
-        if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
-            # GCC 10
-            if (CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 10.0)
-                target_compile_options(${TARGET} PUBLIC -Wconversion)
-            endif()
-
-            # GCC 8
-            if (CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 8.0)
-                target_compile_options(${TARGET} PUBLIC -Wcast-function-type -Wstrict-overflow)
-            endif()
-
-            # GCC 6
-            if (CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 6.0)
-                target_compile_options(${TARGET} PUBLIC -Wno-strict-aliasing)
-            endif()
-        endif()
-    endfunction()
-
-    # configure an executable target to link to tinyusb in device mode, and add the board implementation
-    function(family_configure_device_example TARGET)
-        # default implementation is empty, the function should be redefined in the FAMILY/family.cmake
-    endfunction()
-
-    # configure an executable target to link to tinyusb in host mode, and add the board implementation
-    function(family_configure_host_example TARGET)
-        # default implementation is empty, the function should be redefined in the FAMILY/family.cmake
-    endfunction()
-
-    include(${CMAKE_CURRENT_LIST_DIR}/${FAMILY}/family.cmake)
-
-    if (NOT FAMILY_MCUS)
-        set(FAMILY_MCUS ${FAMILY})
-    endif()
-
-    # save it in case of re-inclusion
-    set(FAMILY_MCUS ${FAMILY_MCUS} CACHE INTERNAL "")
+if (NOT EXISTS ${CMAKE_CURRENT_LIST_DIR}/${FAMILY}/family.cmake)
+  message(FATAL_ERROR "Family '${FAMILY}' is not known/supported")
 endif()
+
+if (NOT FAMILY STREQUAL rp2040)
+  # enable LTO if supported skip rp2040
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT IPO_SUPPORTED)
+  cmake_print_variables(IPO_SUPPORTED)
+  if (IPO_SUPPORTED)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+  endif()
+endif()
+
+if (NOT DEFINED NO_WARN_RWX_SEGMENTS_SUPPORTED)
+  set(NO_WARN_RWX_SEGMENTS_SUPPORTED 1)
+endif()
+
+#----------------------------------
+# RTOS
+#----------------------------------
+if (NOT DEFINED RTOS)
+  set(RTOS noos CACHE STRING "RTOS")
+endif ()
+
+if (RTOS STREQUAL zephyr)
+  set(BOARD_ROOT ${TOP}/hw/bsp/${FAMILY})
+  set(ZEPHYR_BOARD_ALIASES ${CMAKE_CURRENT_LIST_DIR}/zephyr_board_aliases.cmake)
+  find_package(Zephyr REQUIRED HINTS ${TOP}/zephyr)
+  list(REMOVE_ITEM WARN_FLAGS_GNU
+    -Wredundant-decls
+    -Wundef
+    -Wcast-align
+    )
+endif ()
+
+#-------------------------------------------------------------
+# Functions
+#-------------------------------------------------------------
+
+# Filter example based on only.txt and skip.txt
+function(family_filter RESULT DIR)
+  get_filename_component(DIR ${DIR} ABSOLUTE BASE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+
+  if (EXISTS "${DIR}/skip.txt")
+    file(STRINGS "${DIR}/skip.txt" SKIPS_LINES)
+    foreach(MCU IN LISTS FAMILY_MCUS)
+      # For each line in only.txt
+      foreach(_line ${SKIPS_LINES})
+        # If mcu:xxx exists for this mcu then skip
+        if (${_line} STREQUAL "mcu:${MCU}" OR ${_line} STREQUAL "board:${BOARD}" OR ${_line} STREQUAL "family:${FAMILY}")
+          set(${RESULT} 0 PARENT_SCOPE)
+          return()
+        endif()
+      endforeach()
+    endforeach()
+  endif ()
+
+  if (EXISTS "${DIR}/only.txt")
+    file(STRINGS "${DIR}/only.txt" ONLYS_LINES)
+    foreach(MCU IN LISTS FAMILY_MCUS)
+      # For each line in only.txt
+      foreach(_line ${ONLYS_LINES})
+        # If mcu:xxx exists for this mcu or board:xxx then include
+        if (${_line} STREQUAL "mcu:${MCU}" OR ${_line} STREQUAL "board:${BOARD}" OR ${_line} STREQUAL "family:${FAMILY}")
+          set(${RESULT} 1 PARENT_SCOPE)
+          return()
+        endif()
+      endforeach()
+    endforeach()
+
+    # Didn't find it in only file so don't build
+    set(${RESULT} 0 PARENT_SCOPE)
+  else()
+    # only.txt not exist so build
+    set(${RESULT} 1 PARENT_SCOPE)
+  endif()
+endfunction()
+
+function(family_add_subdirectory DIR)
+  family_filter(SHOULD_ADD "${DIR}")
+  if (SHOULD_ADD)
+    add_subdirectory(${DIR})
+  endif()
+endfunction()
+
+function(family_initialize_project PROJECT DIR)
+  # set output suffix to .elf (skip espressif and rp2040)
+  if(NOT FAMILY STREQUAL "espressif" AND NOT FAMILY STREQUAL "rp2040")
+    set(CMAKE_EXECUTABLE_SUFFIX .elf PARENT_SCOPE)
+  endif()
+
+  family_filter(ALLOWED "${DIR}")
+  if (NOT ALLOWED)
+    get_filename_component(SHORT_NAME ${DIR} NAME)
+    message(FATAL_ERROR "${SHORT_NAME} is not supported on FAMILY=${FAMILY}")
+  endif()
+
+  # espressif builds through ESP-IDF's own project.cmake, never through
+  # family_configure_common (family_add_membrowse's normal call site) - every
+  # espressif example's CMakeLists.txt returns right after this function, so hook
+  # it here instead, now that project() has created the ${PROJECT}.elf target.
+  if (FAMILY STREQUAL "espressif")
+    # IDF links its generated scripts by bare name via -L, which ninja extraction cannot resolve
+    set(MEMBROWSE_LD_OVERRIDE
+      $<TARGET_FILE_DIR:${PROJECT}.elf>/esp-idf/esp_system/ld/memory.ld
+      $<TARGET_FILE_DIR:${PROJECT}.elf>/esp-idf/esp_system/ld/sections.ld)
+    # TARGET=PROJECT (no .elf) keeps the custom target/upload name matching every
+    # other family's <board>/<example>; ELF_TARGET=PROJECT.elf is the real CMake
+    # target the .elf/.map/ninja lookups need to resolve.
+    family_add_membrowse(${PROJECT} ${PROJECT}.elf)
+  endif()
+endfunction()
+
+# Add bloaty (https://github.com/google/bloaty/) target, required compile with -g (debug)
+function(family_add_bloaty TARGET)
+  find_program(BLOATY_EXE bloaty)
+  if (BLOATY_EXE STREQUAL BLOATY_EXE-NOTFOUND)
+    return()
+  endif ()
+
+  set(OPTION "--domain=vm -d compileunits,sections,symbols")
+  if (DEFINED BLOATY_OPTION)
+    string(APPEND OPTION " ${BLOATY_OPTION}")
+  endif ()
+  separate_arguments(OPTION_LIST UNIX_COMMAND ${OPTION})
+
+  add_custom_target(${TARGET}-bloaty
+    DEPENDS ${TARGET}
+    COMMAND ${BLOATY_EXE} ${OPTION_LIST} $<TARGET_FILE:${TARGET}>
+    VERBATIM)
+
+  #set_property(TARGET ${TARGET}-bloaty PROPERTY FOLDER ${TARGET}-group)
+  # post build
+  #  add_custom_command(TARGET ${TARGET} POST_BUILD
+  #    COMMAND ${BLOATY_EXE} --csv ${OPTION_LIST} $<TARGET_FILE:${TARGET}> > ${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_bloaty.csv
+  #    VERBATIM
+  #    )
+endfunction()
+
+# Add linkermap target (https://github.com/hathach/linkermap)
+function(family_add_linkermap TARGET)
+  # local-only tool: skip silently when get_deps.py has not fetched it
+  if (NOT EXISTS ${LINKERMAP_PY})
+    return()
+  endif ()
+
+  set(OPTION "-j")
+  if (DEFINED LINKERMAP_OPTION)
+    string(APPEND OPTION " ${LINKERMAP_OPTION}")
+  endif ()
+  separate_arguments(OPTION_LIST UNIX_COMMAND ${OPTION})
+
+  add_custom_target(${TARGET}-linkermap
+    DEPENDS ${TARGET}
+    COMMAND python ${LINKERMAP_PY} ${OPTION_LIST} $<TARGET_FILE:${TARGET}>.map
+    VERBATIM
+    )
+
+  if (NOT TARGET examples-linkermap)
+    add_custom_target(examples-linkermap)
+  endif ()
+  add_dependencies(examples-linkermap ${TARGET}-linkermap)
+endfunction()
+
+# Add membrowse target (installed with pip install membrowse). TARGET names the
+# custom target and the uploaded <board>/<example> report; an optional second
+# argument is the actual CMake executable target to read the ELF/linker info from,
+# for espressif where that differs from TARGET (see family_initialize_project).
+function(family_add_membrowse TARGET)
+  if (ARGC GREATER 1)
+    set(ELF_TARGET ${ARGV1})
+  else ()
+    set(ELF_TARGET ${TARGET})
+  endif ()
+
+  # For Ninja generator, tools/membrowse_report.py extracts linker scripts (with
+  # INCLUDE resolution) and --defsym symbols from the ninja build graph, then runs
+  # `membrowse report` (looked up on PATH, see the script). It also handles
+  # MEMBROWSE_API_KEY at build time (not here at configure time) so the key is never
+  # baked into build.ninja or printed.
+  if (CMAKE_GENERATOR MATCHES "Ninja")
+    set(TARGET_ELF_PATH "$<TARGET_FILE_DIR:${ELF_TARGET}>/$<TARGET_FILE_NAME:${ELF_TARGET}>")
+
+    set(MEMBROWSE_ARGS
+      --build-dir ${CMAKE_BINARY_DIR}
+      --ninja ${CMAKE_MAKE_PROGRAM}
+      --target ${ELF_TARGET}
+      --elf ${TARGET_ELF_PATH}
+      --target-name ${BOARD}/${TARGET}
+      )
+    if (DEFINED MEMBROWSE_OPTION)
+      list(APPEND MEMBROWSE_ARGS --option "${MEMBROWSE_OPTION}")
+    endif ()
+    if (DEFINED MEMBROWSE_LD_OVERRIDE)
+      list(APPEND MEMBROWSE_ARGS --ld ${MEMBROWSE_LD_OVERRIDE})
+    endif ()
+
+    add_custom_target(${TARGET}-membrowse
+      DEPENDS ${ELF_TARGET}
+      COMMAND python ${TOP}/tools/membrowse_report.py ${MEMBROWSE_ARGS}
+      VERBATIM
+      )
+    #set_property(TARGET ${TARGET}-membrowse PROPERTY FOLDER ${TARGET}-group)
+
+    # No DEPENDS on ELF_TARGET here: CI's upload path must still run (as an
+    # --identical metadata-only upload) for a commit that never rebuilt this elf,
+    # so this target must never force a rebuild.
+    add_custom_target(${TARGET}-membrowse-upload
+      COMMAND python ${TOP}/tools/membrowse_report.py ${MEMBROWSE_ARGS} --upload
+      VERBATIM
+      )
+
+    if (NOT TARGET examples-membrowse-upload)
+      add_custom_target(examples-membrowse-upload)
+    endif ()
+    add_dependencies(examples-membrowse-upload ${TARGET}-membrowse-upload)
+
+    #set_property(TARGET ${TARGET}-membrowse-upload PROPERTY FOLDER ${TARGET}-group)
+  endif ()
+endfunction()
+
+
+#-------------------------------------------------------------
+# Common Target Configure
+# Most families use these settings except rp2040 and espressif
+#-------------------------------------------------------------
+function(family_add_board BOARD_TARGET)
+  # empty function, should be overridden in FAMILY/family.cmake
+endfunction()
+
+# Add RTOS to example
+function(family_add_rtos TARGET RTOS)
+  if (RTOS STREQUAL "freertos")
+    # RP2040 family uses Raspberry Pi's FreeRTOS-Kernel fork with platform-specific SMP port
+    if (FAMILY STREQUAL "rp2040")
+      if (NOT TARGET FreeRTOS-Kernel)
+        set(FREERTOS_KERNEL_PATH ${TOP}/hw/mcu/raspberry_pi/FreeRTOS-Kernel)
+        set(FREERTOS_CONFIG_FILE_DIRECTORY ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/${FAMILY}/FreeRTOSConfig)
+        # FreeRTOS_Kernel_import.cmake auto-selects RP2040/RP2350/RISC-V port based on PICO_PLATFORM
+        include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_import.cmake)
+      endif()
+      target_link_libraries(${TARGET} PUBLIC FreeRTOS-Kernel-Static)
+    else()
+      # All other families: use upstream FreeRTOS-Kernel with add_subdirectory
+      if (NOT TARGET freertos_config)
+        add_library(freertos_config INTERFACE)
+        target_include_directories(freertos_config INTERFACE
+          ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/${FAMILY}/FreeRTOSConfig)
+        target_link_libraries(freertos_config INTERFACE board_${BOARD})
+      endif()
+
+      if (NOT TARGET freertos_kernel)
+        add_subdirectory(${TOP}/lib/FreeRTOS-Kernel ${CMAKE_BINARY_DIR}/lib/freertos_kernel)
+      endif ()
+
+      target_link_libraries(${TARGET} PUBLIC freertos_kernel)
+    endif()
+
+    target_compile_definitions(${TARGET} PUBLIC CFG_TUSB_OS=OPT_OS_FREERTOS)
+  elseif (RTOS STREQUAL "threadx")
+    if (NOT TARGET threadx)
+      # Derive THREADX_ARCH from CMAKE_SYSTEM_CPU if not explicitly set
+      if (NOT DEFINED THREADX_ARCH)
+        string(REPLACE "-" "_" THREADX_ARCH ${CMAKE_SYSTEM_CPU})
+      endif ()
+      # Derive THREADX_TOOLCHAIN from TOOLCHAIN if not explicitly set
+      if (NOT DEFINED THREADX_TOOLCHAIN)
+        if (TOOLCHAIN STREQUAL "iar")
+          set(THREADX_TOOLCHAIN "iar")
+        elseif (TOOLCHAIN STREQUAL "clang")
+          set(THREADX_TOOLCHAIN "ac6")
+        else ()
+          set(THREADX_TOOLCHAIN "gnu")
+        endif ()
+      endif ()
+      add_subdirectory(${TOP}/lib/threadx ${CMAKE_BINARY_DIR}/lib/threadx)
+    endif ()
+    target_link_libraries(${TARGET} PUBLIC threadx)
+    target_compile_definitions(${TARGET} PUBLIC CFG_TUSB_OS=OPT_OS_THREADX)
+  elseif (RTOS STREQUAL "zephyr")
+    target_compile_definitions(${TARGET} PUBLIC CFG_TUSB_OS=OPT_OS_ZEPHYR)
+    target_include_directories(${TARGET} PUBLIC ${ZEPHYR_BASE}/include)
+  endif ()
+endfunction()
+
+# Add common configuration to example
+function(family_configure_common TARGET RTOS)
+  # Add board target
+  set(BOARD_TARGET board_${BOARD})
+  if (NOT RTOS STREQUAL zephyr)
+    if (NOT TARGET ${BOARD_TARGET})
+      family_add_board(${BOARD_TARGET})
+      set_target_properties(${BOARD_TARGET} PROPERTIES
+        ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+        SKIP_LINTING ON # need cmake 4.2
+        )
+      if (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        set_target_properties(${BOARD_TARGET} PROPERTIES COMPILE_OPTIONS -w)
+      endif ()
+    endif ()
+    target_link_libraries(${TARGET} PUBLIC ${BOARD_TARGET})
+  endif ()
+
+  family_add_rtos(${TARGET} ${RTOS})
+
+  # Add BOARD_${BOARD} define
+  string(TOUPPER ${BOARD} BOARD_UPPER)
+  string(REPLACE "-" "_" BOARD_UPPER ${BOARD_UPPER})
+  target_compile_definitions(${TARGET} PUBLIC
+    BOARD_${BOARD_UPPER}
+  )
+
+  # CI_BUILD marks firmware built in CI (GitHub Actions sets CI). Examples can use
+  # it to alter behavior under test, e.g. board_test idles to park HIL boards.
+  if(DEFINED ENV{CI})
+    target_compile_definitions(${TARGET} PUBLIC CI_BUILD=1)
+  endif()
+
+  # compile define from command line
+  if(DEFINED CFLAGS_CLI)
+    separate_arguments(CFLAGS_CLI)
+    target_compile_options(${TARGET} PUBLIC ${CFLAGS_CLI})
+  endif()
+
+  # ETM Trace option
+  if (TRACE_ETM STREQUAL "1")
+    target_compile_definitions(${TARGET} PUBLIC TRACE_ETM)
+  endif ()
+
+  # LOGGER option
+  if (DEFINED LOGGER)
+    string(TOUPPER ${LOGGER} LOGGER)
+    target_compile_definitions(${TARGET} PUBLIC LOGGER_${LOGGER})
+    # Add segger rtt to example
+    if(LOGGER STREQUAL "RTT")
+      target_sources(${TARGET} PUBLIC ${TOP}/lib/SEGGER_RTT/RTT/SEGGER_RTT.c)
+      target_include_directories(${TARGET}  PUBLIC ${TOP}/lib/SEGGER_RTT/RTT)
+#      target_compile_definitions(${TARGET}  PUBLIC SEGGER_RTT_MODE_DEFAULT=SEGGER_RTT_MODE_BLOCK_IF_FIFO_FULL)
+      set_source_files_properties(${TOP}/lib/SEGGER_RTT/RTT/SEGGER_RTT.c PROPERTIES SKIP_LINTING ON)
+    endif ()
+  else ()
+    target_compile_definitions(${TARGET} PUBLIC LOGGER_UART)
+  endif ()
+
+  if (FAMILY STREQUAL "rp2040")
+    # RP2040: apply warnings per-source-file (not per-target) since Pico SDK sources
+    # are INTERFACE and would not inherit target-level warnings correctly
+    family_add_default_example_warnings(${TARGET})
+  elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(${TARGET} PRIVATE ${WARN_FLAGS_${CMAKE_C_COMPILER_ID}})
+    target_link_options(${TARGET} PUBLIC "LINKER:-Map=$<TARGET_FILE:${TARGET}>.map")
+    if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0
+      AND NO_WARN_RWX_SEGMENTS_SUPPORTED AND (NOT RTOS STREQUAL zephyr))
+      target_link_options(${TARGET} PUBLIC "LINKER:--no-warn-rwx-segments")
+    endif ()
+  elseif (CMAKE_C_COMPILER_ID STREQUAL "IAR")
+    target_compile_options(${TARGET} PRIVATE $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:${WARN_FLAGS_IAR}>)
+    target_link_options(${TARGET} PUBLIC "LINKER:--map=$<TARGET_FILE:${TARGET}>.map")
+
+    if (IAR_CSTAT)
+      # link time analysis with C-STAT
+      add_custom_command(TARGET ${TARGET} POST_BUILD
+        COMMAND ${CMAKE_C_ICSTAT}
+        --db=${CMAKE_BINARY_DIR}/cstat.db
+        link_analyze -- ${CMAKE_LINKER} $<TARGET_OBJECTS:${TARGET}>
+        COMMAND_EXPAND_LISTS
+        )
+      # generate C-STAT report
+      add_custom_command(TARGET ${TARGET} POST_BUILD
+        COMMAND mkdir -p ${CMAKE_CURRENT_BINARY_DIR}/cstat_report
+        COMMAND ireport --db=${CMAKE_BINARY_DIR}/cstat.db --full --project ${TARGET} --output ${CMAKE_CURRENT_BINARY_DIR}/cstat_report/index.html
+        )
+    endif ()
+  endif ()
+
+  if (NOT RTOS STREQUAL zephyr)
+    # Analyze size with bloaty and linkermap
+    family_add_bloaty(${TARGET})
+    family_add_linkermap(${TARGET})
+    family_add_membrowse(${TARGET})
+  endif ()
+
+  # run size after build
+#  find_program(SIZE_EXE ${CMAKE_SIZE})
+#  if(NOT ${SIZE_EXE} STREQUAL SIZE_EXE-NOTFOUND)
+#    add_custom_command(TARGET ${TARGET} POST_BUILD
+#      COMMAND ${SIZE_EXE} $<TARGET_FILE:${TARGET}>
+#      )
+#  endif ()
+endfunction()
+
+# Add tinyusb to target
+function(family_add_tinyusb TARGET OPT_MCU)
+  # tinyusb's CMakeLists.txt
+  include(${TOP}/src/CMakeLists.txt)
+
+  # Add TinyUSB sources, include and common define
+  tinyusb_target_add(${TARGET})
+  target_compile_definitions(${TARGET} PUBLIC CFG_TUSB_MCU=${OPT_MCU})
+  if (DEFINED LOG)
+    target_compile_definitions(${TARGET} PUBLIC CFG_TUSB_DEBUG=${LOG})
+    if (LOG STREQUAL "4") # no inline for debug level 4
+      target_compile_definitions(${TARGET} PUBLIC TU_ATTR_ALWAYS_INLINE=)
+    endif ()
+  endif()
+
+  # use max3421 as host controller
+  if (MAX3421_HOST STREQUAL "1")
+    target_compile_definitions(${TARGET} PUBLIC CFG_TUH_MAX3421=1)
+    target_sources(${TARGET} PUBLIC
+      ${TOP}/src/portable/analog/max3421/hcd_max3421.c
+      )
+  endif ()
+endfunction()
+
+# Add bin/hex output
+function(family_add_bin_hex TARGET)
+  if (CMAKE_C_COMPILER_ID STREQUAL "IAR")
+    add_custom_command(TARGET ${TARGET} POST_BUILD
+      COMMAND ${CMAKE_OBJCOPY} --bin $<TARGET_FILE:${TARGET}> $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.bin
+      COMMAND ${CMAKE_OBJCOPY} --ihex $<TARGET_FILE:${TARGET}> $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.hex
+      VERBATIM)
+  else()
+    add_custom_command(TARGET ${TARGET} POST_BUILD
+      COMMAND ${CMAKE_OBJCOPY} -Obinary $<TARGET_FILE:${TARGET}> $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.bin
+      COMMAND ${CMAKE_OBJCOPY} -Oihex $<TARGET_FILE:${TARGET}> $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.hex
+      VERBATIM)
+  endif()
+endfunction()
+
+# Add uf2 output
+function(family_add_uf2 TARGET FAMILY_ID)
+  set(BIN_FILE $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.hex)
+  add_custom_command(TARGET ${TARGET} POST_BUILD
+    COMMAND python ${UF2CONV_PY} -f ${FAMILY_ID} -c -o $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.uf2 ${BIN_FILE}
+    VERBATIM)
+endfunction()
+
+#-------------------------------------------------------
+# Example Target Configure (Default rule)
+# These function can be overridden in FAMILY/family.cmake
+#--------------------------------------------------------
+
+function(family_configure_example TARGET RTOS)
+  # empty function, should be overridden in FAMILY/family.cmake
+endfunction()
+
+# Configure device example with RTOS
+function(family_configure_device_example TARGET RTOS)
+  family_configure_example(${TARGET} ${RTOS})
+endfunction()
+
+# Configure host example with RTOS
+function(family_configure_host_example TARGET RTOS)
+  family_configure_example(${TARGET} ${RTOS})
+endfunction()
+
+# Configure host + device example with RTOS
+function(family_configure_dual_usb_example TARGET RTOS)
+  family_configure_example(${TARGET} ${RTOS})
+endfunction()
+
+function(family_example_missing_dependency TARGET DEPENDENCY)
+  message(WARNING "${DEPENDENCY} submodule needed by ${TARGET} not found, please run 'python tools/get_deps.py ${DEPENDENCY}' to fetch it")
+endfunction()
+
+#----------------------------------
+# Flashing target
+#----------------------------------
+
+# Add flash jlink target
+function(family_flash_jlink TARGET)
+  if (NOT DEFINED JLINKEXE)
+    if(CMAKE_HOST_WIN32)
+      set(JLINKEXE JLink.exe)
+    else()
+      set(JLINKEXE JLinkExe)
+    endif()
+  endif ()
+
+  if (NOT DEFINED JLINK_IF)
+    set(JLINK_IF swd)
+  endif ()
+
+  if (NOT DEFINED JLINK_OPTION)
+    set(JLINK_OPTION "")
+  endif ()
+  separate_arguments(OPTION_LIST UNIX_COMMAND ${JLINK_OPTION})
+
+  if (RTOS STREQUAL zephyr)
+    set(BINARY_TARGET zephyr_final)
+    set(NAME_TARGET ${CMAKE_PROJECT_NAME})
+  else ()
+    set(BINARY_TARGET ${TARGET})
+    set(NAME_TARGET ${TARGET})
+  endif ()
+
+  file(GENERATE
+    OUTPUT $<TARGET_FILE_DIR:${BINARY_TARGET}>/${BINARY_TARGET}.jlink
+    CONTENT "halt
+loadfile $<TARGET_FILE:${BINARY_TARGET}>
+r
+go
+exit"
+    )
+
+  add_custom_target(${NAME_TARGET}-jlink
+    DEPENDS ${BINARY_TARGET}
+    COMMAND ${JLINKEXE} -device ${JLINK_DEVICE} ${OPTION_LIST} -if ${JLINK_IF} -JTAGConf -1,-1 -speed auto -CommandFile $<TARGET_FILE_DIR:${BINARY_TARGET}>/${BINARY_TARGET}.jlink
+    VERBATIM
+    )
+
+#  set_property(TARGET ${NAME_TARGET}-jlink PROPERTY FOLDER ${NAME_TARGET}-group)
+endfunction()
+
+
+# Add flash stlink target
+function(family_flash_stlink TARGET)
+  if (NOT DEFINED STM32_PROGRAMMER_CLI)
+    set(STM32_PROGRAMMER_CLI STM32_Programmer_CLI)
+  endif ()
+
+  add_custom_target(${TARGET}-stlink
+    DEPENDS ${TARGET}
+    COMMAND ${STM32_PROGRAMMER_CLI} --connect port=swd --write $<TARGET_FILE:${TARGET}> --go
+    )
+
+  #set_property(TARGET ${TARGET}-stlink PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
+# Add flash st-flash target
+function(family_flash_stflash TARGET)
+  if (NOT DEFINED ST_FLASH)
+    set(ST_FLASH st-flash)
+  endif ()
+
+  add_custom_target(${TARGET}-stflash
+    DEPENDS ${TARGET}
+    COMMAND ${ST_FLASH} write $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.bin 0x8000000
+    )
+
+  #set_property(TARGET ${TARGET}-stflash PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
+# Add flash openocd target.
+# The default 'openocd' should be https://github.com/hathach/openocd (branch tinyusb): which is mainline plus
+# every config the rig needs (RP2350, MAX32/MAX78, WCH) and a drop-in superset of the vendor (downstream) forks
+function(family_flash_openocd TARGET)
+  if (NOT DEFINED OPENOCD)
+    set(OPENOCD openocd)
+  endif ()
+
+  if (NOT DEFINED OPENOCD_OPTION2)
+    set(OPENOCD_OPTION2 "")
+  endif ()
+
+  if (DEFINED OPENOCD_SERIAL)
+    set(OPENOCD_OPTION "-c \"adapter serial ${OPENOCD_SERIAL}\" ${OPENOCD_OPTION}")
+  endif ()
+
+  separate_arguments(OPTION_LIST UNIX_COMMAND ${OPENOCD_OPTION})
+  separate_arguments(OPTION_LIST2 UNIX_COMMAND ${OPENOCD_OPTION2})
+
+  # note skip verify since it has issue with rp2040
+  add_custom_target(${TARGET}-openocd
+    DEPENDS ${TARGET}
+    COMMAND ${OPENOCD} -c "tcl_port disabled; gdb_port disabled" ${OPTION_LIST} -c "init; halt; program $<TARGET_FILE:${TARGET}>" -c reset ${OPTION_LIST2} -c exit
+    VERBATIM
+    )
+
+  #set_property(TARGET ${TARGET}-openocd PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+# Add flash openocd adi (Analog Devices) target using the openocd included
+# with msdk (MAXIM_PATH), otherwise the default openocd
+function(family_flash_openocd_adi TARGET)
+  # use openocd from msdk if MAXIM_PATH is set, as cmake variable or in the
+  # environment. Normalize the latter since msdk can be Windows (MinGW) or Linux
+  if (NOT DEFINED MAXIM_PATH AND DEFINED ENV{MAXIM_PATH})
+    file(TO_CMAKE_PATH "$ENV{MAXIM_PATH}" MAXIM_PATH)
+  endif ()
+
+  if (MAXIM_PATH)
+    if (NOT DEFINED OPENOCD)
+      set(OPENOCD ${MAXIM_PATH}/Tools/OpenOCD/openocd)
+    endif ()
+    set(OPENOCD_OPTION2 "-s ${MAXIM_PATH}/Tools/OpenOCD/scripts")
+  endif ()
+
+  family_flash_openocd(${TARGET})
+endfunction()
+
+# Add flash openocd-nuvoton target
+# compiled from https://github.com/OpenNuvoton/OpenOCD-Nuvoton
+function(family_flash_openocd_nuvoton TARGET)
+  if (NOT DEFINED OPENOCD)
+    set(OPENOCD $ENV{HOME}/app/OpenOCD-Nuvoton/src/openocd)
+    set(OPENOCD_OPTION2 "-s $ENV{HOME}/app/OpenOCD-Nuvoton/tcl")
+  endif ()
+
+  family_flash_openocd(${TARGET})
+endfunction()
+
+
+# Add flash with https://github.com/ch32-rs/wlink
+function(family_flash_wlink_rs TARGET)
+  if (NOT DEFINED WLINK_RS)
+    set(WLINK_RS wlink)
+  endif ()
+
+  add_custom_target(${TARGET}-wlink-rs
+    DEPENDS ${TARGET}
+    COMMAND ${WLINK_RS} flash $<TARGET_FILE:${TARGET}>
+    )
+
+  #set_property(TARGET ${TARGET}-wlink-rs PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
+# Add flash pycod target
+function(family_flash_pyocd TARGET)
+  if (NOT DEFINED PYOC)
+    set(PYOCD pyocd)
+  endif ()
+
+  add_custom_target(${TARGET}-pyocd
+    DEPENDS ${TARGET}
+    COMMAND ${PYOCD} flash -t ${PYOCD_TARGET} $<TARGET_FILE:${TARGET}>
+    )
+
+  #set_property(TARGET ${TARGET}-pyocd PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
+# Add flash with https://probe.rs
+function(family_flash_probe_rs TARGET)
+  if (NOT DEFINED PROBE_RS)
+    set(PROBE_RS probe-rs)
+  endif ()
+
+  separate_arguments(OPTION_LIST UNIX_COMMAND ${PROBE_RS_OPTION})
+
+  add_custom_target(${TARGET}-probe-rs
+    DEPENDS ${TARGET}
+    COMMAND ${PROBE_RS} download --chip ${PROBE_RS_CHIP} ${OPTION_LIST} --verify --reset $<TARGET_FILE:${TARGET}>
+    VERBATIM
+    )
+
+  #set_property(TARGET ${TARGET}-probe-rs PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
+# Flash with UF2
+function(family_flash_uf2 TARGET FAMILY_ID)
+  add_custom_target(${TARGET}-uf2
+    DEPENDS ${TARGET}
+    COMMAND python ${UF2CONV_PY} -f ${FAMILY_ID} --deploy $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.uf2
+    )
+  #set_property(TARGET ${TARGET}-uf2 PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
+# Add flash teensy_cli target
+function(family_flash_teensy TARGET)
+  if (NOT DEFINED TEENSY_CLI)
+    set(TEENSY_CLI teensy_loader_cli)
+  endif ()
+
+  add_custom_target(${TARGET}-teensy
+    DEPENDS ${TARGET}
+    COMMAND ${CMAKE_OBJCOPY} -Oihex $<TARGET_FILE:${TARGET}> $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.hex
+    COMMAND ${TEENSY_CLI} --mcu=${TEENSY_MCU} -w -s $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.hex
+    )
+
+  #set_property(TARGET ${TARGET}-teensy PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
+# Add flash using NXP's LinkServer (redserver)
+# https://www.nxp.com/design/software/development-software/mcuxpresso-software-and-tools-/linkserver-for-microcontrollers:LINKERSERVER
+function(family_flash_nxplink TARGET)
+  if (NOT DEFINED LINKSERVER)
+    set(LINKSERVER LinkServer)
+  endif ()
+
+  # LinkServer has a bug that can only execute with full path otherwise it throws:
+  # realpath error: No such file or directory
+  execute_process(COMMAND which ${LINKSERVER} OUTPUT_VARIABLE LINKSERVER_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  add_custom_target(${TARGET}-nxplink
+    DEPENDS ${TARGET}
+    COMMAND ${LINKSERVER_PATH} flash ${NXPLINK_DEVICE} load $<TARGET_FILE:${TARGET}>
+    )
+
+  #set_property(TARGET ${TARGET}-nxplink PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
+function(family_flash_dfu_util TARGET OPTION)
+  if (NOT DEFINED DFU_UTIL)
+    set(DFU_UTIL dfu-util)
+  endif ()
+
+  add_custom_target(${TARGET}-dfu-util
+    DEPENDS ${TARGET}
+    COMMAND ${DFU_UTIL} -R -d ${DFU_UTIL_VID_PID} -a 0 -D $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.bin
+    VERBATIM
+    )
+
+  #set_property(TARGET ${TARGET}-dfu-util PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+function(family_flash_msp430flasher TARGET)
+  if (NOT DEFINED MSP430Flasher)
+    set(MSP430FLASHER MSP430Flasher)
+  endif ()
+
+  # set LD_LIBRARY_PATH to find libmsp430.so (directory containing MSP430Flasher)
+  find_program(MSP430FLASHER_PATH MSP430Flasher)
+  get_filename_component(MSP430FLASHER_PARENT_DIR "${MSP430FLASHER_PATH}" DIRECTORY)
+  add_custom_target(${TARGET}-msp430flasher
+    DEPENDS ${TARGET}
+    COMMAND ${CMAKE_COMMAND} -E env LD_LIBRARY_PATH=${MSP430FLASHER_PARENT_DIR}
+            ${MSP430FLASHER} -w $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.hex -z [VCC]
+    )
+
+  #set_property(TARGET ${TARGET}-msp430flasher PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+function(family_flash_rfp TARGET)
+  if (NOT DEFINED RFP_CLI)
+    set(RFP_CLI rfp-cli)
+  endif ()
+
+  add_custom_target(${TARGET}-rfp
+    DEPENDS ${TARGET}
+    COMMAND ${CMAKE_OBJCOPY} -O srec -I elf32-rx-be-ns $<TARGET_FILE:${TARGET}> $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.mot
+    COMMAND ${RFP_CLI} -device ${RFP_DEVICE} -tool ${RFP_TOOL} -if fine
+      -fo id FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+      -auth id FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+      -auto $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.mot
+    VERBATIM
+    )
+
+  #set_property(TARGET ${TARGET}-rfp PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
+function(family_flash_uniflash TARGET)
+  if (NOT DEFINED DSLITE)
+    set(DSLITE dslite.sh)
+  endif ()
+
+  separate_arguments(OPTION_LIST UNIX_COMMAND ${UNIFLASH_OPTION})
+
+  add_custom_target(${TARGET}-uniflash
+    DEPENDS ${TARGET}
+    COMMAND ${DSLITE} ${UNIFLASH_OPTION} -f $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.hex
+    VERBATIM
+    )
+
+  #set_property(TARGET ${TARGET}-uniflash PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+# Add flash lm4flash target (lightweight flasher for TI Tiva-C/Stellaris ICDI boards)
+function(family_flash_lm4flash TARGET)
+  if (NOT DEFINED LM4FLASH)
+    set(LM4FLASH lm4flash)
+  endif ()
+
+  if (NOT DEFINED LM4FLASH_OPTION)
+    set(LM4FLASH_OPTION "")
+  endif ()
+  separate_arguments(OPTION_LIST UNIX_COMMAND ${LM4FLASH_OPTION})
+
+  add_custom_target(${TARGET}-lm4flash
+    DEPENDS ${TARGET}
+    COMMAND ${LM4FLASH} ${OPTION_LIST} $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.bin
+    VERBATIM
+    )
+
+  #set_property(TARGET ${TARGET}-lm4flash PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+# Add flash ft9xx target need to remove kernal's ftdi_sio and bind D2XX drivers
+# sudo rmmod ftdi_sio && for i in 0 1 2 3; do sudo sh -c "echo 3-3.4:1.$i > /sys/bus/usb/drivers/ftdi_sio/unbind" 2>/dev/null; done
+function(family_flash_ft9xx TARGET)
+  if (NOT DEFINED FT9XXPROG)
+    set(FT9XXPROG FT9xxProg)
+  endif ()
+
+  add_custom_target(${TARGET}-ft9xx
+    DEPENDS ${TARGET}
+    COMMAND ${FT9XXPROG} -f $<TARGET_FILE_DIR:${TARGET}>/${TARGET}.bin
+    )
+
+  #set_property(TARGET ${TARGET}-ft9xx PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+#----------------------------------
+# Family specific
+#----------------------------------
+
+# family specific: can override above functions
+include(${CMAKE_CURRENT_LIST_DIR}/${FAMILY}/family.cmake)
+
+if (NOT FAMILY_MCUS)
+  set(FAMILY_MCUS ${FAMILY})
+endif()
+
+# if use max3421 as host controller, expand FAMILY_MCUS to include max3421
+if (MAX3421_HOST STREQUAL "1")
+  set(FAMILY_MCUS ${FAMILY_MCUS} MAX3421)
+endif ()
+
+# What this configure selected, for tools/family_json.py to join with the compile
+# database into the board's hw/bsp/family.json row. Written on every configure;
+# tools/build.py decides whether the configure was the board's default one.
+set(_FJ_MCUS "")
+foreach(_FJ_M ${FAMILY_MCUS})
+  string(REPLACE "\\" "\\\\" _FJ_M "${_FJ_M}")
+  string(REPLACE "\"" "\\\"" _FJ_M "${_FJ_M}")
+  list(APPEND _FJ_MCUS "\"${_FJ_M}\"")
+endforeach()
+list(JOIN _FJ_MCUS ", " _FJ_MCUS)
+set(_FJ_OPTIONS "")
+if (DEFINED MAX3421_HOST)
+  string(REPLACE "\\" "\\\\" _FJ_V "${MAX3421_HOST}")
+  string(REPLACE "\"" "\\\"" _FJ_V "${_FJ_V}")
+  set(_FJ_OPTIONS "\"MAX3421_HOST\": \"${_FJ_V}\"")
+endif ()
+file(WRITE ${CMAKE_BINARY_DIR}/family.json.part
+  "{\"board\": \"${BOARD}\", \"family\": \"${FAMILY}\", \"family_mcus\": [${_FJ_MCUS}], \"options\": {${_FJ_OPTIONS}}}\n")
+
+# save it in case of re-inclusion
+set(FAMILY_MCUS ${FAMILY_MCUS} CACHE INTERNAL "")

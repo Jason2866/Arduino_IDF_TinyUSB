@@ -7,17 +7,17 @@
  * The MIT License (MIT)
  *
  * Copyright (c) 2015 by Sergey Fetisov <fsenok@gmail.com>
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  * copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included in all
  * copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -29,23 +29,28 @@
 
 #include <stdalign.h>
 #include <string.h>
-#include "class/net/net_device.h"
+#include "tusb.h"
+
+#if CFG_TUD_ECM_RNDIS
+
 #include "rndis_protocol.h"
 #include "netif/ethernet.h"
 
-#define RNDIS_LINK_SPEED 12000000                       /* Link baudrate (12Mbit/s for USB-FS) */
 #define RNDIS_VENDOR     "TinyUSB"                      /* NIC vendor name */
+
+// USB link speed in bits/sec, reflected to host via OID_GEN_LINK_SPEED.
+static inline uint32_t rndis_link_speed_bps(void) {
+  return (tud_speed_get() == TUSB_SPEED_HIGH) ? 480000000U : 12000000U;
+}
 
 static const uint8_t *const station_hwaddr = tud_network_mac_address;
 static const uint8_t *const permanent_hwaddr = tud_network_mac_address;
 
 static usb_eth_stat_t usb_eth_stat = { 0, 0, 0, 0 };
 static uint32_t oid_packet_filter = 0x0000000;
-static rndis_state_t rndis_state;
+TU_ATTR_UNUSED static rndis_state_t rndis_state;
 
-CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN static uint8_t ndis_report[8] = { 0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00 };
-
-static const uint32_t OIDSupportedList[] = 
+static const uint32_t OIDSupportedList[] =
 {
   OID_GEN_SUPPORTED_LIST,
   OID_GEN_HARDWARE_STATUS,
@@ -76,8 +81,8 @@ static const uint32_t OIDSupportedList[] =
 
 static void *encapsulated_buffer;
 
-static void rndis_report(void)
-{
+static void rndis_report(void) {
+  uint8_t ndis_report[8] = { 0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00 };
   netd_report(ndis_report, sizeof(ndis_report));
 }
 
@@ -126,7 +131,7 @@ static void rndis_query(void)
     case OID_GEN_MEDIA_IN_USE:           rndis_query_cmplt32(RNDIS_STATUS_SUCCESS, NDIS_MEDIUM_802_3); return;
     case OID_GEN_PHYSICAL_MEDIUM:        rndis_query_cmplt32(RNDIS_STATUS_SUCCESS, NDIS_MEDIUM_802_3); return;
     case OID_GEN_HARDWARE_STATUS:        rndis_query_cmplt32(RNDIS_STATUS_SUCCESS, 0); return;
-    case OID_GEN_LINK_SPEED:             rndis_query_cmplt32(RNDIS_STATUS_SUCCESS, RNDIS_LINK_SPEED / 100); return;
+    case OID_GEN_LINK_SPEED:             rndis_query_cmplt32(RNDIS_STATUS_SUCCESS, rndis_link_speed_bps() / 100U); return;
     case OID_GEN_VENDOR_ID:              rndis_query_cmplt32(RNDIS_STATUS_SUCCESS, 0x00FFFFFF); return;
     case OID_GEN_VENDOR_DESCRIPTION:     rndis_query_cmplt(RNDIS_STATUS_SUCCESS, rndis_vendor, strlen(rndis_vendor) + 1); return;
     case OID_GEN_CURRENT_PACKET_FILTER:  rndis_query_cmplt32(RNDIS_STATUS_SUCCESS, oid_packet_filter); return;
@@ -203,8 +208,8 @@ static void rndis_handle_set_msg(void)
       {
         rndis_packetFilter(oid_packet_filter);
         rndis_state = rndis_data_initialized;
-      } 
-      else 
+      }
+      else
       {
         rndis_state = rndis_initialized;
       }
@@ -266,7 +271,7 @@ void rndis_class_set_handler(uint8_t *data, int size)
     case REMOTE_NDIS_QUERY_MSG:
       rndis_query();
       break;
-      
+
     case REMOTE_NDIS_SET_MSG:
       rndis_handle_set_msg();
       break;
@@ -301,3 +306,5 @@ void rndis_class_set_handler(uint8_t *data, int size)
       break;
   }
 }
+
+#endif
